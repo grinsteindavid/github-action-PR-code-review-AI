@@ -1,0 +1,296 @@
+name: OpenAI Code Review
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 100  # Ensure we have enough history for the git log
+      
+      - name: Get PR Details
+        id: pr_details
+        run: |
+          PR_DETAILS=$(gh pr view ${{ github.event.pull_request.number }} --json title,body)
+
+          # Extract title to file
+          echo $PR_DETAILS | jq -r '.title' > pr_title.txt
+          echo "PR title saved to file:"
+          cat pr_title.txt
+          
+          # Extract body to file and clean HTML comments
+          echo $PR_DETAILS | jq -r '.body' | sed 's/<!--.*-->//g' > pr_body.txt
+          echo "PR body saved to file:"
+          cat pr_body.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch Previous Bot Comments with Timestamps
+        id: prev_reviews
+        run: |
+          # Fetch all comments from the PR with timestamps
+          gh pr view ${{ github.event.pull_request.number }} --json comments > pr_comments.json
+          
+          # Extract reviews with creation timestamps, sorted by date (newest first)
+          jq '.comments[] | select(.body | startswith("CODE REVIEW -")) | {body: .body, createdAt: .createdAt}' pr_comments.json | 
+            jq -s 'sort_by(.createdAt) | reverse' > previous_reviews_with_time.json
+          
+          # Print the number of previous reviews found
+          if [ -s previous_reviews_with_time.json ] && [ "$(jq 'length' previous_reviews_with_time.json)" -gt 0 ]; then
+            REVIEW_COUNT=$(jq 'length' previous_reviews_with_time.json)
+            echo "Found $REVIEW_COUNT previous review comments"
+            
+            # Extract the timestamp of the latest review
+            LATEST_REVIEW_DATE=$(jq -r '.[0].createdAt' previous_reviews_with_time.json)
+            echo "latest_review_date=$LATEST_REVIEW_DATE" >> $GITHUB_OUTPUT
+            echo "has_previous_review=true" >> $GITHUB_OUTPUT
+            
+            # Format timestamp for git (convert from ISO 8601 to git-compatible format)
+            GIT_DATE=$(date -d "$LATEST_REVIEW_DATE" +"%Y-%m-%d %H:%M:%S" 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$LATEST_REVIEW_DATE" +"%Y-%m-%d %H:%M:%S" 2>/dev/null)
+            echo "git_date=$GIT_DATE" >> $GITHUB_OUTPUT
+            echo "Latest review was on: $GIT_DATE"
+          else
+            echo "No previous reviews found"
+            echo "[]" > previous_reviews_with_time.json
+            echo "has_previous_review=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Create a summary file with previous reviews
+          echo "Previous review summaries:" > previous_reviews_summary.txt
+          if [ "$(jq 'length' previous_reviews_with_time.json)" -gt 0 ]; then
+            # Format each review with its timestamp
+            jq -r '.[] | "Review from " + .createdAt + ":\n" + .body' previous_reviews_with_time.json >> previous_reviews_summary.txt
+            echo "Previous reviews summary created"
+          else
+            echo "No previous reviews found" >> previous_reviews_summary.txt
+          fi
+          cat previous_reviews_summary.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get Filtered PR Diff
+        run: |
+          if [ "${{ steps.prev_reviews.outputs.has_previous_review }}" == "true" ]; then
+            # Get diff only for changes made after the latest review
+            echo "Filtering diff for changes since ${{ steps.prev_reviews.outputs.git_date }}"
+            SINCE_DATE="${{ steps.prev_reviews.outputs.git_date }}"
+            
+            # Get the base commit of the PR
+            BASE_COMMIT=$(git merge-base ${{ github.event.pull_request.base.sha }} HEAD)
+            
+            # Get commits since the latest review date
+            NEW_COMMITS=$(git log --since="$SINCE_DATE" --format="%H" HEAD)
+            
+            if [ -n "$NEW_COMMITS" ]; then
+              # Create a filtered diff of only changes since the last review
+              git diff $BASE_COMMIT..HEAD --diff-filter=ACMRT -- $(git log --since="$SINCE_DATE" --name-only --pretty=format: HEAD | sort -u) > pr_diff.txt
+              echo "Created filtered diff of changes since last review"
+              head -c 500 pr_diff.txt # Show preview of diff
+              
+              # Check if filtered diff is empty
+              if [ ! -s pr_diff.txt ]; then
+                echo "No new changes since last review"
+                echo "No new changes since last review." > pr_diff.txt
+              fi
+            else
+              echo "No new commits since last review"
+              echo "No new commits since last review." > pr_diff.txt
+            fi
+          else
+            # No previous reviews, use full diff
+            gh pr diff ${{ github.event.pull_request.number }} | head -c 20000 > pr_diff.txt
+            echo "Using full PR diff (no previous reviews found)"
+          fi
+          
+          cat pr_diff.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Get Diff Stats
+        run: |
+          # Get diff stats to show files changed with additions/deletions counts
+          gh pr diff ${{ github.event.pull_request.number }} --patch | git apply --stat > diff_stats.txt
+          echo "Diff stats:"
+          cat diff_stats.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Recent Commit History
+        run: |
+          # Get the last 50 commits to provide context about recent changes
+          git log -n 50 --pretty=format:"%h %ad %s" --date=short > commit_history.txt
+          echo "Recent commit history:"
+          cat commit_history.txt
+
+      - name: Extract README.md
+        run: |
+          # Extract the root README.md to include in the review
+          if [ -f "README.md" ]; then
+            cat README.md > project_readme.txt
+            echo "README.md content extracted"
+            cat project_readme.txt
+          else
+            echo "README.md not found" > project_readme.txt
+          fi
+      
+      - name: Generate Project Structure
+        run: |
+          # Create a more detailed project structure with type, size, and children count
+          {
+            echo "Project Structure:"
+            find . -maxdepth 3 -not -path "*/\.git*" | while read path; do
+              # Get relative path
+              rel_path="${path#./}"
+              if [ -z "$rel_path" ]; then continue; fi
+              
+              # Determine if it's a file or directory
+              if [ -d "$path" ]; then
+                type="directory"
+                # Count children (recursively)
+                child_count=$(find "$path" -mindepth 1 -not -path "*/\.git*" | wc -l | tr -d ' ')
+                size="N/A"
+                echo "- $rel_path (Type: $type, Children: $child_count)"
+              else
+                type="file"
+                # Get file size in bytes
+                size=$(stat -f %z "$path" 2>/dev/null || stat --format=%s "$path" 2>/dev/null)
+                echo "- $rel_path (Type: $type, Size: $size bytes)"
+              fi
+            done
+          } > project_structure.txt
+          cat project_structure.txt
+
+      - name: Send PR Diff to OpenAI for Review
+        run: |
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          BASE_BRANCH="${{ github.event.pull_request.base.ref }}"
+          DIFF_CONTENT=$(jq -Rs . < pr_diff.txt)
+          RULES_CONTENT=$(jq -Rs . < .windsurfrules)
+          PR_TITLE=$(jq -Rs . < pr_title.txt)
+          PR_BODY=$(jq -Rs . < pr_body.txt)
+          PROJECT_STRUCTURE=$(jq -Rs . < project_structure.txt)
+          DIFF_STATS=$(jq -Rs . < diff_stats.txt)
+          README_CONTENT=$(jq -Rs . < project_readme.txt)
+          COMMIT_HISTORY=$(jq -Rs . < commit_history.txt)
+          SYSTEM_PROMPT=$(cat <<EOF
+          You are a helpful AI assistant, senior software engineer, and mentor that performs code reviews.
+
+          ---------------------------
+          CURRENT_BRANCH: $CURRENT_BRANCH
+          BASE_BRANCH: $BASE_BRANCH
+          ---------------------------
+          Global Rules: $(jq -Rs . < .windsurfrules)
+          ---------------------------
+          Project README: $(jq -Rs . < project_readme.txt)
+          ---------------------------
+          Project Structure: $(jq -Rs . < project_structure.txt)
+          ---------------------------
+          PR Title: $(jq -Rs . < pr_title.txt)
+          ---------------------------
+          PR Description: $(jq -Rs . < pr_body.txt)
+          ---------------------------
+
+          IMPORTANT:
+          - Use Recent Commit History + Diff Summary + Previous AI Reviews timestamps to understand and filter the context of the PR.
+          - Previous AI Reviews are summaries that you already provided.
+          - IF Previous AI Reviews were provided, do not provide the same feedback/content again even if the user provide the same previous PR Diff.
+          - DO NOT REPEAT feedback/reviews that was already provided.
+          - Focus on providing ONLY NEW insights or feedback for changes made since the last review or dont provide any feedback if there is no new feedback.
+          - If previous reviews have covered a topic, DO NOT REPEAT THE SAME FEEDBACK AND SAY SO.
+          - Your task is to evaluate the provided code (Diff Content) for best practices, security vulnerabilities, performance optimizations, and adherence to coding standards along Global Rules provided ONLY ON CONTENT THAT IS NOT ALREADY COVERED IN YOUR PREVIOUS REVIEWS.
+          - Provide clear, concise, and actionable feedback only related to the diff content.
+          - Highlight any potential issues and suggest improvements if applicable and only about the diff content.
+          - Congratulate the user on good practices.
+          - PR Title might be unclear if the user does not provide a clear title.
+          - PR Description is a template prompt for developers (users) to extend context for this code review.
+          - Project Structure is a 3-level directory structure.
+          - Diff Content is the changes between the current branch and the base branch.
+          - Use as many examples as possible to support your points.
+          - Do not tell the user about the global rules unless the diff content is related to the global rules (avoid unnecessary information).
+          - Project README is to help you understand the project.
+          - DO NOT SUGGEST CHANGES TO THE CODE THAT IS NOT RELATED TO THE DIFF CONTENT.
+          EOF
+          )
+          
+          # Save system prompt to file for debugging and maintenance
+          echo "$SYSTEM_PROMPT" > system_prompt.txt
+    
+          # Create JSON request file to avoid argument list too long error
+          cat > openai_request.json <<EOF
+          {
+            "model": "gpt-4o-mini",
+            "messages": [
+              {
+                "role": "system",
+                "content": $(jq -Rs . < system_prompt.txt)
+              },
+              {
+                "role": "user",
+                "content": "the following are Previous AI Reviews that you already made."
+              },
+              {
+                "role": "user",
+                "content": $(jq -Rs . < previous_reviews_summary.txt)
+              },
+              {
+                "role": "user",
+                "content": "the following are Diff Summary (Files Changed)"
+              },
+              {
+                "role": "user",
+                "content": $(jq -Rs . < diff_stats.txt)
+              },
+              {
+                "role": "user",
+                "content": "the following are Recent Commit History"
+              },
+              {
+                "role": "user",
+                "content": $(jq -Rs . < commit_history.txt)
+              },
+              {
+                "role": "user",
+                "content": "${{ steps.prev_reviews.outputs.has_previous_review == 'true' && format('IMPORTANT: The following diff has been FILTERED to only show changes made since the last review on {0}. Previous feedback has already been addressed.', steps.prev_reviews.outputs.git_date) || 'This is the first review for this PR, showing the complete diff.' }}"
+              },
+              {
+                "role": "user",
+                "content": $(jq -Rs . < pr_diff.txt)
+              }
+            ]
+          }
+          EOF
+
+          cat openai_request.json
+          
+          # Use --data-binary with the JSON file instead of -d with inline data
+          RESPONSE=$(curl -s -w "%{http_code}" -o response.json https://api.openai.com/v1/chat/completions \
+            -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            --data-binary @openai_request.json
+          )
+
+          HTTP_STATUS=$(tail -n1 <<< "$RESPONSE")
+          if [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "Error: Received HTTP status $HTTP_STATUS"
+            cat response.json
+            exit 1
+          fi
+
+          REVIEW=$(jq -r '.choices[0].message.content' response.json)
+          if [ -z "$REVIEW" ]; then
+            echo "Error: Review content is null or empty"
+            exit 1
+          fi
+
+          echo "CODE REVIEW - Commit ID: ${{ github.sha }}" >> review.md
+          echo "" >> review.md
+          echo "$REVIEW" >> review.md
+          gh pr comment ${{ github.event.pull_request.number }} -F review.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
