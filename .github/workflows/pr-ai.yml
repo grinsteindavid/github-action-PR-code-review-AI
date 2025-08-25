@@ -213,7 +213,6 @@ jobs:
           - DO NOT REPEAT feedback/reviews that was already provided.
           - Focus on providing ONLY NEW insights or feedback for changes made since the last review or dont provide any feedback if there is no new feedback.
           - If previous reviews have covered a topic, DO NOT REPEAT THE SAME FEEDBACK AND SAY SO.
-          - Your task is to evaluate the provided code (Diff Content) for best practices, security vulnerabilities, performance optimizations, and adherence to coding standards along Global Rules provided ONLY ON CONTENT THAT IS NOT ALREADY COVERED IN YOUR PREVIOUS REVIEWS.
           - Provide clear, concise, and actionable feedback only related to the diff content.
           - Highlight any potential issues and suggest improvements if applicable and only about the diff content.
           - Congratulate the user on good practices.
